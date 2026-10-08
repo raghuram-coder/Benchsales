@@ -19,6 +19,9 @@ rules out c2c / 1099 unless they are explicitly allowed elsewhere).
 """
 import re
 
+# bump when classify() rules change: saved jobs are re-tagged once on next start
+VERSION = 2
+
 TAGS = ["fulltime", "c2c", "w2", "contract", "1099", "c2h", "parttime"]
 TAG_LABELS = {
     "fulltime": "Full-time",
@@ -40,18 +43,36 @@ _FT = (r"(?:full[\s\-_]?time|fulltime|permanent|direct[\s\-]*hire|\bfte\b|"
 _CONTRACT = r"(?:\bcontract(?:or)?\b|\btemp(?:orary)?\b|freelance)"
 _PT = r"(?:part[\s\-_]?time|parttime)"
 
-_NEG_BEFORE = r"(?:\bno\b|\bnot\b|\bwithout\b|\bnon[\s\-]|\bcannot\b|\bcan'?t\b|\bno\s+third[\s\-]*party\s+or)\s*(?:\w+\s+){0,2}$"
+_NEGATOR = re.compile(r"\b(?:no|not|without|non|cannot|can'?t|never)\b[\s\-]*", re.I)
+_POSITIVE_BREAK = re.compile(r"\b(?:but|however|yes|accept\w*|welcome|ok|okay|open to)\b", re.I)
 _NEG_AFTER = (r"^\W{0,3}(?:\w+\s+){0,2}"
               r"(?:not\s+(?:accepted|allowed|considered|available|eligible|open|an option|permitted)|"
               r"is\s+not|are\s+not|unavailable|isn'?t|aren'?t)")
 
 
+def _negated_before(text: str, start: int) -> bool:
+    """True if a negator ("no", "not", "without", "non-") governs the term at
+    `start`: it sits in the same clause (no . ; : ! ? or newline between) and
+    the words in between are just a list ("No third party/C2C or 1099" negates
+    both C2C and 1099). A comma or a word like "but"/"accepted" ends the effect."""
+    head = text[:start]
+    cut = max(head.rfind(c) for c in ".;:!?\n")
+    clause = head[cut + 1:]
+    last = None
+    for last in _NEGATOR.finditer(clause):
+        pass
+    if last is None:
+        return False
+    between = clause[last.end():]
+    return (len(between) <= 40 and "," not in between
+            and not _POSITIVE_BREAK.search(between))
+
+
 def _mentions(pattern: str, text: str):
     """Yield (positive: bool) for each mention of pattern in text."""
     for m in re.finditer(pattern, text, re.I):
-        before = text[max(0, m.start() - 24):m.start()]
         after = text[m.end():m.end() + 40]
-        neg = bool(re.search(_NEG_BEFORE, before, re.I)) or \
+        neg = _negated_before(text, m.start()) or \
             bool(re.search(_NEG_AFTER, after, re.I))
         yield not neg
 
@@ -81,8 +102,8 @@ def classify(employment_type: str = "", title: str = "",
 
     # "W2 only" / "only W2" -> W2, and rule out c2c / 1099 unless stated
     # positively on their own elsewhere (e.g. "W2 only. 1099 not accepted").
-    w2_only = re.search(rf"{_W2}\s*(?:only|candidates only|employees only)|"
-                        rf"only\s+{_W2}", text, re.I)
+    w2_only = re.search(rf"{_W2}\s*(?:only|candidates only|employees only|"
+                        rf"required|requirement|position only)|only\s+{_W2}", text, re.I)
     if w2_only:
         tags.add("w2")
         tags.discard("c2c")
@@ -139,3 +160,13 @@ def matches_filter(job_tags: list[str], wanted: list[str],
 
 def parse_wanted(s: str) -> list[str]:
     return [t for t in (s or "").lower().replace(" ", "").split(",") if t in TAGS]
+
+
+if __name__ == "__main__":
+    from app import db
+    c = db.get_conn()
+    for r in c.execute("SELECT id,employment_type,title,description FROM jobs").fetchall():
+        c.execute("UPDATE jobs SET emp_tags=? WHERE id=?",
+                  (to_db(classify(r[1], r[2], r[3])), r[0]))
+    c.commit()
+    print("done")
