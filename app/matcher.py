@@ -1,8 +1,9 @@
 """Consultant <-> job scoring for BenchPilot (0-100)."""
 import re
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 
-from . import db
+from . import db, emptype
 from .skills import extract_skills, requirements_skills
 
 STOPWORDS = {"a", "an", "the", "and", "or", "of", "for", "to", "in", "on",
@@ -45,14 +46,31 @@ def consultant_title(raw_text: str) -> str:
     return first.split("|")[0].strip()
 
 
+@lru_cache(maxsize=4096)
+def _jd_skills(jd_text: str) -> tuple[frozenset, frozenset]:
+    """Skill extraction is the slow part and is identical for every consultant
+    scored against the same job, so cache it by description text."""
+    jd = frozenset(extract_skills(jd_text))
+    return jd, frozenset(requirements_skills(jd_text)) & jd
+
+
+def emp_compatible(consultant: dict, job_tags: list) -> bool:
+    """A consultant who only takes e.g. W2 should not be matched to a job that
+    explicitly says C2C only. Jobs with no detectable type always pass, and a
+    consultant with no stated preference matches everything."""
+    pref = emptype.parse_wanted(consultant.get("emp_pref") or "")
+    if not pref or not job_tags:
+        return True
+    return bool(set(pref) & set(job_tags))
+
+
 def score(consultant: dict, job: dict) -> dict:
     """consultant: dict with raw_text, skills(list), location.
     job: dict with title, location, remote_flag, description, posted_at.
     Returns {score, breakdown, missing_skills}."""
     resume_skills = set(consultant.get("skills") or [])
     jd_text = job.get("description") or ""
-    jd_skills = set(extract_skills(jd_text))
-    req_skills = requirements_skills(jd_text) & jd_skills
+    jd_skills, req_skills = _jd_skills(jd_text)
 
     # 70% skill overlap (requirements-section skills count 2x)
     possible = 0
@@ -101,7 +119,7 @@ def score(consultant: dict, job: dict) -> dict:
     return {
         "score": score100,
         "breakdown": breakdown,
-        "missing_skills": sorted(jd_skills - resume_skills),
+        "missing_skills": sorted(set(jd_skills) - resume_skills),
     }
 
 
@@ -116,10 +134,15 @@ def run_all(threshold: float | None = None) -> int:
     consultants = db.consultants_with_resumes()
     with db.get_conn() as conn:
         jobs = [dict(r) for r in conn.execute("SELECT * FROM jobs")]
+        # one query instead of one connection per (consultant, job) pair
+        existing = {(r["consultant_id"], r["job_id"]) for r in conn.execute(
+            'SELECT consultant_id, job_id FROM "matches"')}
     new = 0
     for c in consultants:
         for j in jobs:
-            if db.match_exists(c["id"], j["id"]):
+            if (c["id"], j["id"]) in existing:
+                continue
+            if not emp_compatible(c, emptype.from_db(j.get("emp_tags") or "")):
                 continue
             r = score(c, j)
             if r["score"] >= threshold:

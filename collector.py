@@ -9,7 +9,7 @@ import sys
 import traceback
 from datetime import datetime, timezone
 
-from app import db
+from app import db, usa
 from app import matcher
 from app.sources import adzuna, jsearch, remoteok, remotive, arbeitnow, dice
 
@@ -50,8 +50,12 @@ def run() -> dict:
             try:
                 fetched = 0
                 new = 0
+                usa_only = settings.get("usa_only", "1") == "1"
                 for q in queries:
-                    for job in mod.fetch(q, settings):
+                    batch = mod.fetch(q, settings)
+                    if usa_only:
+                        batch = usa.filter_us(batch)
+                    for job in batch:
                         fetched += 1
                         if db.insert_job(job):
                             new += 1
