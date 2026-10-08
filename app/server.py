@@ -13,7 +13,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app import db
+from app import db, emptype, portals, usa
 from app import matcher as matcher_mod
 from app import tailor as tailor_mod
 from app.skills import extract_skills
@@ -202,8 +202,35 @@ async def api_upload_resume(cid: int, file: UploadFile = File(...)):
 
 # ---------- jobs ----------
 @app.get("/api/jobs")
-def api_list_jobs(source: str = "", q: str = "", limit: int = 50):
-    return db.list_jobs(source=source, q=q, limit=limit)
+def api_list_jobs(source: str = "", q: str = "", limit: int = 50,
+                  emp: str = "", include_unspecified: bool = False):
+    """emp = comma list of full-time/c2c/w2/... tags (OR). Jobs whose type
+    could not be detected are hidden when emp is set, unless
+    include_unspecified=true."""
+    return db.list_jobs(source=source, q=q, limit=limit,
+                        emp=emptype.parse_wanted(emp),
+                        include_unspecified=include_unspecified)
+
+
+@app.get("/api/emp-types")
+def api_emp_types():
+    return [{"tag": t, "label": emptype.TAG_LABELS[t]} for t in emptype.TAGS]
+
+
+@app.get("/api/portals")
+def api_portals(title: str = "", location: str = "", emp: str = "",
+                days: int = 7):
+    """Pre-filled search links for Dice, Indeed, LinkedIn, ZipRecruiter..."""
+    if not title.strip():
+        raise HTTPException(400, "title is required")
+    return portals.build_links(title, location, emptype.parse_wanted(emp),
+                               max(1, min(days, 30)))
+
+
+@app.get("/api/portals/check")
+def api_portals_check():
+    """Can the server reach each portal? (Runs ~8 quick HTTP requests.)"""
+    return portals.check_reachability()
 
 
 @app.post("/api/jobs/import-url")
@@ -248,6 +275,14 @@ def api_live_search(data: dict):
     except json.JSONDecodeError:
         enabled_sources = set(db.DEFAULT_ENABLED_SOURCES)
     query = {"title": title, "location": location}
+    emp_wanted = emptype.parse_wanted(",".join(data.get("emp") or [])
+                                      if isinstance(data.get("emp"), list)
+                                      else (data.get("emp") or ""))
+    include_unspecified = bool(data.get("include_unspecified"))
+    usa_only = (settings.get("usa_only", "1") == "1") and data.get("usa_only", True)
+    # let the live search steer the per-source filters the same way collection does
+    if emp_wanted:
+        settings = {**settings, "collect_emp_types": ",".join(emp_wanted)}
     jobs: list[dict] = []
     sources: dict = {}
     for mod in LIVE_SOURCES:
@@ -260,9 +295,18 @@ def api_live_search(data: dict):
             sources[name] = {"label": label, "status": "needs API key — add it in Settings", "count": 0}
             continue
         try:
-            fetched = mod.fetch(query, settings)[:30]
+            fetched = mod.fetch(query, settings)
+            if usa_only:
+                fetched = usa.filter_us(fetched)
             for j in fetched:
                 j["temp_id"] = f"{name}:{j.get('source_id')}"
+                j["emp_tags"] = emptype.classify(
+                    j.get("employment_type", ""), j.get("title", ""),
+                    j.get("description", ""))
+            if emp_wanted:
+                fetched = [j for j in fetched if emptype.matches_filter(
+                    j["emp_tags"], emp_wanted, include_unspecified)]
+            fetched = fetched[:30]
             jobs.extend(fetched)
             sources[name] = {"label": label, "status": "ok", "count": len(fetched)}
         except Exception as e:  # noqa: BLE001 - one bad source shouldn't kill the search
@@ -290,6 +334,7 @@ def api_save_live(data: dict):
     saved, dupes = 0, 0
     for j in jobs:
         j.pop("temp_id", None)
+        j.pop("emp_tags", None)  # recomputed on insert
         if db.insert_job(j):
             saved += 1
         else:
@@ -381,7 +426,7 @@ def api_put_settings(data: dict):
     allowed = {"match_threshold", "search_queries", "enabled_sources",
                "adzuna_app_id", "adzuna_app_key", "rapidapi_key",
                "llm_base_url", "llm_api_key", "llm_model",
-               "collect_interval_minutes"}
+               "collect_interval_minutes", "usa_only", "collect_emp_types"}
     for k, v in data.items():
         if k not in allowed:
             raise HTTPException(400, f"unknown setting: {k}")
@@ -409,7 +454,7 @@ def api_sources_status():
         configured = mod.enabled(settings)
         state = "disabled"
         if name == "dice":
-            state = "disabled (no public API — use Adzuna or URL import)"
+            state = "link-out only (no public API) — use Portal search links, Adzuna or URL import"
         elif name in enabled_sources:
             state = "ready" if configured else "needs credentials"
         out.append({

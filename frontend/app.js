@@ -94,6 +94,28 @@ const skelCards = (n) => Array.from({length: n}, () =>
 const skelRows = (n) => Array.from({length: n}, () =>
   `<div class="skel" style="height:44px;margin-bottom:8px">&nbsp;</div>`).join("");
 
+/* ---------- employment types (USA market) ---------- */
+const EMP_TYPES = [["fulltime", "Full-time"], ["c2c", "C2C"], ["w2", "W2"],
+  ["contract", "Contract"], ["1099", "1099"], ["c2h", "Contract-to-hire"],
+  ["parttime", "Part-time"]];
+const EMP_LABEL = Object.fromEntries(EMP_TYPES);
+const EMP_DEFAULT = ["fulltime", "c2c", "w2"];
+function tagBadges(tags) {
+  return (tags || []).map((t) => `<span class="tag tag-${esc(t)}">${esc(EMP_LABEL[t] || t)}</span>`).join("");
+}
+/* chip row; read back with readEmp(container) */
+function empChips(selected, attr) {
+  return EMP_TYPES.map(([k, label]) => `<label class="chip-toggle"><input type="checkbox" ${attr}="${k}"${selected.includes(k) ? " checked" : ""}><span>${esc(label)}</span></label>`).join("");
+}
+function readEmp(root, attr) {
+  return $$(`[${attr}]`, root).filter((c) => c.checked).map((c) => c.getAttribute(attr));
+}
+function empPasses(tags, wanted, unspec) {
+  if (!wanted.length) return true;
+  if (!tags || !tags.length) return unspec;
+  return tags.some((t) => wanted.includes(t));
+}
+
 /* ---------- tab nav ---------- */
 $("#tabs").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-tab]");
@@ -155,6 +177,7 @@ async function renderConsultants() {
           <button class="btn danger" data-del="${c.id}">Remove</button>
         </span></div>
       <div class="muted">${esc(c.location)}${c.visa_status ? " · " + esc(c.visa_status) : ""}</div>
+      <div class="muted">Open to: ${c.emp_pref ? c.emp_pref.split(",").map((t) => esc(EMP_LABEL[t] || t)).join(", ") : "any engagement type"}</div>
       <div class="muted">${esc(c.email)}${c.phone ? " · " + esc(c.phone) : ""}</div>
       <div style="margin:8px 0">
         ${c.has_resume
@@ -212,8 +235,10 @@ function consultantModal(c) {
       <label>Location</label><input type="text" id="m-location" value="${esc(c.location || "")}" placeholder="Houston, TX">
       <label>Visa status</label><input type="text" id="m-visa" value="${esc(c.visa_status || "")}" placeholder="H1B / GC / Citizen">
       <label>LinkedIn URL</label><input type="url" id="m-li" value="${esc(c.linkedin_url || "")}">
+      <label>Open to</label><div id="m-emp" class="chiprow">${empChips((c.emp_pref || "").split(",").filter(Boolean), "data-memp")}</div>
       <label>Notes</label><textarea id="m-notes" rows="2">${esc(c.notes || "")}</textarea>
     </div>
+    <div class="muted" style="margin-bottom:8px">Open to: leave all unchecked to match every engagement type. If you tick some, jobs that explicitly list only other types (e.g. "C2C only") are not matched to this consultant.</div>
     <div class="row"><button class="btn primary" id="m-save">Save</button>
     <button class="btn" id="m-cancel">Cancel</button></div>`);
   $("#m-cancel").onclick = closeModal;
@@ -221,7 +246,8 @@ function consultantModal(c) {
     const data = {name: $("#m-name").value, email: $("#m-email").value,
       phone: $("#m-phone").value, location: $("#m-location").value,
       visa_status: $("#m-visa").value, linkedin_url: $("#m-li").value,
-      notes: $("#m-notes").value};
+      notes: $("#m-notes").value,
+      emp_pref: readEmp($("#m-emp"), "data-memp").join(",")};
     if (c.id) await api(`/api/consultants/${c.id}`, {method: "PUT", body: JSON.stringify(data)});
     else await api("/api/consultants", {method: "POST", body: JSON.stringify(data)});
     closeModal();
@@ -238,7 +264,7 @@ function jobDrawerHtml(j, opts) {
     <button class="drawer-close" aria-label="Close">✕</button>
     <div class="row" style="gap:8px;margin-bottom:10px">
       <span class="badge ${esc(j.source || "")}">${esc(j.source || "job")}</span>
-      ${j.remote_flag ? `<span class="badge">remote</span>` : ""}</div>
+      ${j.remote_flag ? `<span class="badge">remote</span>` : ""}${tagBadges(j.emp_tags)}</div>
     <h2>${esc(j.title)}</h2>
     <div class="muted" style="margin-bottom:10px">${esc(j.company)}${j.location ? " · " + esc(j.location) : ""}</div>
     <div class="row" style="gap:14px;margin-bottom:6px">
@@ -283,7 +309,9 @@ async function openJobDrawer(job, opts) {
 }
 
 /* ================= JOBS ================= */
-let jobsFilter = {source: "", q: "", remote: false, location: "", emptype: "", posted: "", sort: "newest"};
+const jobsDefaults = () => ({source: "", q: "", remote: false, location: "", emp: EMP_DEFAULT.slice(),
+  unspec: true, posted: "", sort: "newest"});
+let jobsFilter = jobsDefaults();
 let jobsCache = [];
 async function renderJobs() {
   const el = $("#tab-jobs");
@@ -292,12 +320,19 @@ async function renderJobs() {
       <button class="btn primary" id="j-run">Run job collection</button></div>
     <div class="muted" id="j-fresh" style="margin:-4px 0 10px"></div>
     <div class="progress" id="j-prog"></div>
+    <div class="card" id="j-empbar"><div class="row" style="gap:12px;flex-wrap:wrap">
+      <b>Employment type</b>
+      <span class="chiprow" id="j-emp">${empChips(jobsFilter.emp, "data-jemp")}</span>
+      <label class="fcheck"><input type="checkbox" id="j-unspec"${jobsFilter.unspec ? " checked" : ""}> include jobs with no type listed</label></div>
+      <div class="muted" style="margin-top:6px">USA market. Applies to live search, portal links and the job board below. A job counts as C2C / W2 when its type or description says so (and "no C2C" / "W2 only" are understood).</div></div>
     <div class="card"><h3>Live job search</h3>
       <div class="muted" style="margin-bottom:8px">Type a job title — BenchPilot searches the boards right now and shows listings instantly.</div>
       <div class="row">
         <input type="text" id="j-live-title" placeholder="job title, e.g. AI test engineer" style="flex:2;min-width:220px">
         <input type="text" id="j-live-loc" placeholder="location, e.g. Texas (optional)" style="flex:1;min-width:160px">
-        <button class="btn primary" id="j-live-go">Search live</button></div>
+        <button class="btn primary" id="j-live-go">Search live</button>
+        <button class="btn" id="j-portal-go" title="Open Dice, Indeed, LinkedIn... with this search pre-filled">Portal links</button></div>
+      <div id="j-portals" style="margin-top:8px"></div>
       <div id="j-live-status" class="muted" style="margin-top:6px"></div>
       <div id="j-live-results" style="margin-top:8px"></div></div>
     <div class="card"><h3>Import a posting URL</h3>
@@ -314,8 +349,6 @@ async function renderJobs() {
           <select id="j-source"><option value="">All sources</option></select></div>
         <div><label class="flabel" for="j-loc">Location</label>
           <input type="text" id="j-loc" placeholder="city, state…" value="${esc(jobsFilter.location)}"></div>
-        <div><label class="flabel" for="j-emp">Employment type</label>
-          <select id="j-emp"><option value="">Any type</option></select></div>
         <div><label class="flabel" for="j-posted">Posted</label>
           <select id="j-posted">
             <option value="">Any time</option>
@@ -357,14 +390,20 @@ async function renderJobs() {
   $("#j-q").addEventListener("input", jLive((v) => { jobsFilter.q = v; applyJobFilters(); }));
   $("#j-loc").addEventListener("input", jLive((v) => { jobsFilter.location = v; applyJobFilters(); }));
   $("#j-source").onchange = (e) => { jobsFilter.source = e.target.value; applyJobFilters(); };
-  $("#j-emp").onchange = (e) => { jobsFilter.emptype = e.target.value; applyJobFilters(); };
+  $("#j-empbar").addEventListener("change", () => {
+    jobsFilter.emp = readEmp($("#j-emp"), "data-jemp");
+    jobsFilter.unspec = $("#j-unspec").checked;
+    applyJobFilters();
+  });
   $("#j-posted").onchange = (e) => { jobsFilter.posted = e.target.value; applyJobFilters(); };
   $("#j-sort").onchange = (e) => { jobsFilter.sort = e.target.value; applyJobFilters(); };
   $("#j-remote").onchange = (e) => { jobsFilter.remote = e.target.checked; applyJobFilters(); };
   $("#j-reset").onclick = () => {
-    jobsFilter = {source: "", q: "", remote: false, location: "", emptype: "", posted: "", sort: "newest"};
+    jobsFilter = jobsDefaults();
     $("#j-q").value = ""; $("#j-loc").value = "";
-    $("#j-source").value = ""; $("#j-emp").value = "";
+    $("#j-source").value = "";
+    $$("[data-jemp]").forEach((c) => c.checked = jobsFilter.emp.includes(c.dataset.jemp));
+    $("#j-unspec").checked = jobsFilter.unspec;
     $("#j-posted").value = ""; $("#j-sort").value = "newest";
     $("#j-remote").checked = false;
     applyJobFilters();
@@ -380,7 +419,8 @@ async function renderJobs() {
     box.innerHTML = "";
     try {
       const r = await api("/api/jobs/live-search",
-        {method: "POST", body: JSON.stringify({title, location})});
+        {method: "POST", body: JSON.stringify({title, location,
+          emp: jobsFilter.emp, include_unspecified: jobsFilter.unspec})});
       liveResults = r.jobs;
       st.innerHTML = Object.values(r.sources)
         .map((s) => `${esc(s.label)}: ${esc(s.status)}${s.count ? ` (${s.count})` : ""}`)
@@ -395,9 +435,9 @@ async function renderJobs() {
         <div class="card" style="padding:0"><table class="jobs">
           <tr><th>Title</th><th>Company</th><th>Location</th><th>Source</th><th></th></tr>
           ${liveResults.map((j, i) => `<tr data-liveidx="${i}">
-            <td><b>${esc(j.title)}</b>${j.salary ? `<div class="muted">${esc(j.salary)}</div>` : ""}</td>
+            <td><b>${esc(j.title)}</b>${j.salary ? `<div class="muted">${esc(j.salary)}</div>` : ""}<div>${tagBadges(j.emp_tags)}</div></td>
             <td>${esc(j.company)}</td>
-            <td>${esc(j.location)}${j.remote_flag ? " (remote)" : ""}</td>
+            <td>${esc(j.location)}${j.remote_flag && !/remote/i.test(j.location || "") ? " (remote)" : ""}</td>
             <td><span class="badge ${esc(j.source)}">${esc(j.source)}</span></td>
             <td><div class="row">
               ${j.url ? `<a class="btn" href="${esc(j.url)}" target="_blank" rel="noopener">view</a>` : ""}
@@ -412,6 +452,20 @@ async function renderJobs() {
     } catch (e) { st.textContent = "error: " + e.message; }
   };
   $("#j-live-go").onclick = doLiveSearch;
+  /* portal deep links (Dice, Indeed, LinkedIn...) */
+  $("#j-portal-go").onclick = async () => {
+    const title = $("#j-live-title").value.trim();
+    const box = $("#j-portals");
+    if (!title) { box.innerHTML = `<span class="muted">Type a job title first.</span>`; return; }
+    try {
+      const qs = new URLSearchParams({title, location: $("#j-live-loc").value.trim(),
+        emp: jobsFilter.emp.join(","), days: "7"});
+      const links = await api("/api/portals?" + qs);
+      box.innerHTML = `<div class="muted" style="margin-bottom:6px">Opens in a new tab with your search and employment-type filters pre-filled. Sign in to each portal in your own browser. (Dice, Indeed and LinkedIn block automated collection, so these are the reliable way in.)</div>
+        <div class="row" style="flex-wrap:wrap">${links.map((l) =>
+          `<a class="btn" href="${esc(l.url)}" target="_blank" rel="noopener" title="${esc(l.note)}">${esc(l.label)}</a>`).join("")}</div>`;
+    } catch (e) { box.innerHTML = `<div class="errbox">${esc(e.message)}</div>`; }
+  };
   $("#j-live-title").onkeydown = (e) => { if (e.key === "Enter") doLiveSearch(); };
   $("#j-live-loc").onkeydown = (e) => { if (e.key === "Enter") doLiveSearch(); };
   $("#j-live-results").addEventListener("click", (e) => {
@@ -446,21 +500,18 @@ async function loadJobs() {
   const el = $("#j-list");
   if (!el) return;
   el.innerHTML = skelRows(8);
-  jobsCache = await api("/api/jobs?limit=500");
+  jobsCache = await api("/api/jobs?limit=1000");
   const srcs = await api("/api/sources/status");
   $("#j-source").innerHTML = `<option value="">All sources</option>` +
     srcs.filter((s) => s.name !== "urlimport")
       .map((s) => `<option value="${s.name}"${jobsFilter.source === s.name ? " selected" : ""}>${esc(s.label)}</option>`).join("");
-  const types = [...new Set(jobsCache.map((j) => (j.employment_type || "").trim()).filter(Boolean))].sort();
-  $("#j-emp").innerHTML = `<option value="">Any type</option>` +
-    types.map((t) => `<option${jobsFilter.emptype === t ? " selected" : ""}>${esc(t)}</option>`).join("");
   applyJobFilters();
 }
 function jobMatches(j) {
   const f = jobsFilter;
   if (f.source && j.source !== f.source) return false;
   if (f.remote && !j.remote_flag) return false;
-  if (f.emptype && (j.employment_type || "").trim() !== f.emptype) return false;
+  if (!empPasses(j.emp_tags, f.emp, f.unspec)) return false;
   if (f.location && !(j.location || "").toLowerCase().includes(f.location.toLowerCase())) return false;
   if (f.posted) {
     if (!j.posted_at) return false;
@@ -486,8 +537,8 @@ function applyJobFilters() {
   $("#j-list").innerHTML = `<div class="card" style="padding:0"><table class="jobs">
     <tr><th>Title</th><th>Company</th><th>Location</th><th>Source</th><th>Posted</th><th></th></tr>
     ${list.map((j) => `<tr data-jobid="${j.id}">
-      <td><b>${esc(j.title)}</b>${j.salary ? `<div class="muted">${esc(j.salary)}</div>` : ""}</td>
-      <td>${esc(j.company)}</td><td>${esc(j.location)}${j.remote_flag ? " (remote)" : ""}</td>
+      <td><b>${esc(j.title)}</b>${j.salary ? `<div class="muted">${esc(j.salary)}</div>` : ""}<div>${tagBadges(j.emp_tags)}</div></td>
+      <td>${esc(j.company)}</td><td>${esc(j.location)}${j.remote_flag && !/remote/i.test(j.location || "") ? " (remote)" : ""}</td>
       <td><span class="badge ${esc(j.source)}">${esc(j.source)}</span></td>
       <td class="muted" title="${esc((j.posted_at || "").slice(0, 10))}">${j.posted_at ? esc(ago(j.posted_at)) : "—"}</td>
       <td>${j.url ? `<a href="${esc(j.url)}" target="_blank" rel="noopener">view</a>` : ""}</td>
@@ -534,7 +585,8 @@ async function runCollection() {
 }
 
 /* ================= MATCHES ================= */
-let matchFilter = {consultant_id: "", min_score: 0, source: "", sort: "best"};
+let matchFilter = {consultant_id: "", min_score: 0, source: "", sort: "best",
+  emp: EMP_DEFAULT.slice(), unspec: true};
 async function renderMatches() {
   const el = $("#tab-matches");
   el.innerHTML = `<div class="row spread"><h2>Matches</h2></div>
@@ -552,7 +604,10 @@ async function renderMatches() {
         </select></div>
       <div><span class="flabel">&nbsp;</span>
         <button class="btn primary" id="mt-go">Apply filters</button></div>
-    </div></div>
+    </div>
+    <div class="row" style="gap:12px;flex-wrap:wrap;margin-top:10px"><b>Employment type</b>
+      <span class="chiprow" id="mt-emp">${empChips(matchFilter.emp, "data-memp2")}</span>
+      <label class="fcheck"><input type="checkbox" id="mt-unspec"${matchFilter.unspec ? " checked" : ""}> include jobs with no type listed</label></div></div>
     <div id="mt-count" class="muted" style="margin:0 2px 8px"></div>
     <div id="mt-list" class="grid"></div>`;
   const cs = await api("/api/consultants");
@@ -567,6 +622,8 @@ async function renderMatches() {
     matchFilter.min_score = Number($("#mt-s").value) || 0;
     matchFilter.source = $("#mt-src").value;
     matchFilter.sort = $("#mt-sort").value;
+    matchFilter.emp = readEmp($("#mt-emp"), "data-memp2");
+    matchFilter.unspec = $("#mt-unspec").checked;
     loadMatches();
   };
   loadMatches();
@@ -574,15 +631,21 @@ async function renderMatches() {
 async function loadMatches() {
   const el = $("#mt-list");
   el.innerHTML = skelCards(6);
-  let ms = await api(`/api/matches?consultant_id=${matchFilter.consultant_id}&min_score=${matchFilter.min_score}`);
+  // only send consultant_id when one is chosen: an empty "consultant_id=" is
+  // not a valid integer and strict API validation would reject it
+  const mq = new URLSearchParams({min_score: String(matchFilter.min_score || 0)});
+  if (matchFilter.consultant_id) mq.set("consultant_id", matchFilter.consultant_id);
+  let ms = await api(`/api/matches?${mq}`);
   if (matchFilter.source) ms = ms.filter((m) => m.source === matchFilter.source);
+  ms = ms.filter((m) => empPasses(m.emp_tags, matchFilter.emp, matchFilter.unspec));
   ms.sort((a, b) => matchFilter.sort === "low" ? a.score - b.score : b.score - a.score);
   const cnt = $("#mt-count");
   if (cnt) cnt.textContent = `${ms.length} matches`;
   el.innerHTML = ms.map((m) => `
     <div class="card">
       <div class="row spread">
-        <div><b>${esc(m.job_title)}</b><div class="muted">${esc(m.company)} · ${esc(m.location)}</div></div>
+        <div><b>${esc(m.job_title)}</b><div class="muted">${esc(m.company)} · ${esc(m.location)}</div>
+          <div>${tagBadges(m.emp_tags)}</div></div>
         <span class="badge ${esc(m.source)}">${esc(m.source)}</span>
       </div>
       <div class="row" style="margin:8px 0">
@@ -769,7 +832,16 @@ async function renderSettings() {
         return `<div class="srcstat"><span class="dot ${dot}"></span>
           <b>${esc(x.label)}</b><span class="muted">${esc(x.state)}${last}</span></div>`;
       }).join("")}
-      <div class="muted" style="margin-top:8px">Dice has no public API (all endpoints 404 as of Oct 2026) — Dice coverage comes from Adzuna aggregation and manual URL import.</div>
+      <div class="muted" style="margin-top:8px">Dice, Indeed and LinkedIn block automated collection (Dice has no public API at all). Job data for Indeed/LinkedIn comes through JSearch; for all three, use <b>Portal links</b> on the Jobs tab to open the real site with your search pre-filled, or paste a posting link into <b>Import URL</b>.</div>
+      <div class="row" style="margin-top:10px"><button class="btn" id="s-portcheck">Check portal access</button>
+        <span class="muted">Tests whether this server can reach each portal.</span></div>
+      <div id="s-portres" style="margin-top:8px"></div>
+    </div>
+    <div class="card"><h3>USA market</h3>
+      <label class="toggle"><input type="checkbox" id="s-usa"${s.usa_only === "0" ? "" : " checked"}> USA jobs only (drop postings that clearly name a non-US location; blank / "Remote" are kept)</label>
+      <div style="margin-top:10px"><b>Employment types to collect</b>
+        <div class="chiprow" id="s-emp" style="margin-top:6px">${empChips((s.collect_emp_types || "fulltime,c2c,w2").split(",").filter(Boolean), "data-semp")}</div>
+        <div class="muted" style="margin-top:6px">Steers the Adzuna and JSearch queries (C2C, W2 and 1099 roles are all requested as "contractor" from JSearch). Everything fetched is still tagged, so you can narrow further on the Jobs tab.</div></div>
     </div>
     <div class="card"><h3>API keys</h3>
       <div class="kv">
@@ -809,6 +881,18 @@ async function renderSettings() {
     <div class="row"><button class="btn primary" id="s-save">Save settings</button>
       <span class="muted" id="s-msg"></span></div>`;
 
+  $("#s-portcheck").onclick = async () => {
+    const box = $("#s-portres");
+    box.innerHTML = `<span class="muted">Checking… (up to ~30 seconds)</span>`;
+    try {
+      const rows = await api("/api/portals/check");
+      box.innerHTML = rows.map((r) => {
+        const dot = r.state === "reachable" ? "ok" : r.state.startsWith("up,") ? "off" : "err";
+        return `<div class="srcstat"><span class="dot ${dot}"></span><b>${esc(r.label)}</b>
+          <span class="muted">${esc(r.state)}${r.http_status ? " (HTTP " + r.http_status + ")" : ""}</span></div>`;
+      }).join("");
+    } catch (e) { box.innerHTML = `<div class="errbox">${esc(e.message)}</div>`; }
+  };
   const qbox = $("#s-queries");
   const qrow = (q) => {
     const d = document.createElement("div");
@@ -837,6 +921,8 @@ async function renderSettings() {
       enabled_sources: $$("[data-src]").filter((c) => c.checked).map((c) => c.dataset.src),
       match_threshold: $("#s-thr").value,
       collect_interval_minutes: $("#s-interval").value,
+      usa_only: $("#s-usa").checked ? "1" : "0",
+      collect_emp_types: readEmp($("#s-emp"), "data-semp").join(","),
     };
     // don't overwrite saved keys with the masked echo
     for (const k of ["adzuna_app_key", "rapidapi_key", "llm_api_key"])
