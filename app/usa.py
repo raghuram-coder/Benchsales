@@ -25,6 +25,27 @@ STATE_NAMES = [
     "virginia", "washington", "west virginia", "wisconsin", "wyoming",
     "district of columbia",
 ]
+# "CA" -> "california": lets "Irvine, CA" and "California, USA" count as the
+# same state when scoring location fit.
+STATE_ABBR_TO_NAME = {
+    "AL": "alabama", "AK": "alaska", "AZ": "arizona", "AR": "arkansas",
+    "CA": "california", "CO": "colorado", "CT": "connecticut",
+    "DE": "delaware", "DC": "district of columbia", "FL": "florida",
+    "GA": "georgia", "HI": "hawaii", "ID": "idaho", "IL": "illinois",
+    "IN": "indiana", "IA": "iowa", "KS": "kansas", "KY": "kentucky",
+    "LA": "louisiana", "ME": "maine", "MD": "maryland",
+    "MA": "massachusetts", "MI": "michigan", "MN": "minnesota",
+    "MS": "mississippi", "MO": "missouri", "MT": "montana",
+    "NE": "nebraska", "NV": "nevada", "NH": "new hampshire",
+    "NJ": "new jersey", "NM": "new mexico", "NY": "new york",
+    "NC": "north carolina", "ND": "north dakota", "OH": "ohio",
+    "OK": "oklahoma", "OR": "oregon", "PA": "pennsylvania",
+    "RI": "rhode island", "SC": "south carolina", "SD": "south dakota",
+    "TN": "tennessee", "TX": "texas", "UT": "utah", "VT": "vermont",
+    "VA": "virginia", "WA": "washington", "WV": "west virginia",
+    "WI": "wisconsin", "WY": "wyoming",
+}
+
 _US_WORDS = re.compile(
     r"\b(united states|usa|u\.s\.a?\.?|us only|americas|north america|"
     r"nationwide|anywhere in the us)\b|\bUS\b", re.I)
@@ -37,7 +58,18 @@ _NON_US = re.compile(
     r"alberta|toronto|vancouver|mexico|brazil|argentina|colombia|chile|"
     r"philippines|vietnam|indonesia|nigeria|kenya|egypt|south africa|uae|"
     r"dubai|berlin|london|paris|madrid|amsterdam|dublin|bangalore|bengaluru|"
-    r"hyderabad|pune|mumbai|chennai|delhi)\b", re.I)
+    r"hyderabad|pune|mumbai|chennai|delhi|kolkata|noida|gurgaon|gurugram|"
+    r"ahmedabad|jaipur|bangladesh|dhaka|sri lanka|nepal|malaysia|"
+    r"kuala lumpur|korea|seoul|thailand|bangkok|taiwan|taipei|hong kong|"
+    r"russia|moscow|kazakhstan|kyrgyzstan|bishkek|uzbekistan|hungary|"
+    r"budapest|prague|warsaw|vienna|zurich|geneva|lisbon|rome|milan|"
+    r"barcelona|brussels|stockholm|oslo|copenhagen|helsinki|athens|greece|"
+    r"bulgaria|sofia|serbia|belgrade|croatia|lithuania|latvia|estonia|"
+    r"slovakia|slovenia|riga|vilnius|tallinn|bratislava|melbourne|sydney|"
+    r"auckland|peru|lima|bogota|santiago|buenos aires|sao paulo|"
+    r"mexico city|morocco|ghana|ethiopia|saudi arabia|qatar|riyadh|"
+    r"tel aviv|istanbul|ankara|karachi|lahore|islamabad|jakarta|manila|"
+    r"hanoi|ho chi minh|remoto)\b|\b\w+-ii\b", re.I)
 _STATE_ABBR = re.compile(r",\s*([A-Z]{2})\b")
 _STATE_NAME = re.compile(r"\b(" + "|".join(STATE_NAMES) + r")\b", re.I)
 _WORLDWIDE = re.compile(r"\b(worldwide|anywhere|global|international)\b", re.I)

@@ -147,3 +147,14 @@ frontend/            vanilla JS + CSS dashboard (no build step)
 demo/                2 sample resumes + seed.py (zero-key demo data)
 tests/               unit tests (python -m unittest discover -s tests)
 ```
+
+## Automatic mode (no one has to press anything)
+
+While the app is running it looks after itself:
+
+- **Searches come from the resumes.** Each consultant's headline role (for example "QA Automation Engineer") + their city, and "Remote", become the job searches. Upload a new resume and the searches change, and a job search starts right away.
+- **Skills are learned.** New tool names in a resume's Skills section are added to the skill list automatically (Settings > Fully automatic mode shows them; click x to remove one for good). Stored resume skills and existing match scores are recalculated when that happens. Matches are never deleted.
+- **Refresh schedule survives restarts.** The time of the last run is saved, so a restart does not reset the clock.
+- **Free-key safety.** Adzuna's free key allows 250 calls/day and 2,500/month. The app counts its calls, stays under "Adzuna calls per day" (default 80) and slows the schedule down when needed.
+
+Still needs a person: changing the code, and keeping the app awake. A free Replit app can sleep when nobody visits; an always-on plan (or a small server) keeps the schedule running 24/7.

@@ -160,13 +160,3 @@ def matches_filter(job_tags: list[str], wanted: list[str],
 
 def parse_wanted(s: str) -> list[str]:
     return [t for t in (s or "").lower().replace(" ", "").split(",") if t in TAGS]
-
-
-if __name__ == "__main__":
-    from app import db
-    c = db.get_conn()
-    for r in c.execute("SELECT id,employment_type,title,description FROM jobs").fetchall():
-        c.execute("UPDATE jobs SET emp_tags=? WHERE id=?",
-                  (to_db(classify(r[1], r[2], r[3])), r[0]))
-    c.commit()
-    print("done")

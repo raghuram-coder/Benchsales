@@ -217,7 +217,9 @@ async function renderConsultants() {
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || "upload failed");
       msg.textContent = `parsed ${d.skills.length} skills`;
-      toast(`Resume parsed — ${d.skills.length} skills`, "ok");
+      toast(`Resume parsed — ${d.skills.length} skills`
+        + (d.learned_skills && d.learned_skills.length ? `, learned ${d.learned_skills.length} new` : "")
+        + (d.searching_jobs ? ". Searching jobs for this role now…" : ""), "ok");
       refreshBadges();
       renderConsultants();
     } catch (e) { msg.textContent = "error: " + e.message; toast("Upload failed: " + e.message, "err"); }
@@ -557,7 +559,8 @@ async function updateFreshness() {
     const last = st.last_result
       ? ` (+${st.last_result.jobs_new} new jobs, +${st.last_result.matches_new} new matches)` : "";
     if (st.interval_minutes > 0) {
-      f.textContent = `Auto-refresh every ${st.interval_minutes} min · last run ${ago(st.last_run_at)}${last}`;
+      f.textContent = `Auto-refresh every ${st.interval_minutes} min · last run ${ago(st.last_run_at)}${last}`
+        + (st.auto_queries && st.queries && st.queries.length ? ` · searching ${st.queries.length} role/place combos taken from the resumes` : "");
     } else {
       f.textContent = st.last_run_at
         ? `Auto-refresh is off · last run ${ago(st.last_run_at)}${last} — click "Run job collection" for fresh data`
@@ -854,7 +857,19 @@ async function renderSettings() {
       </div>
       <div class="muted">Keys are stored on this machine only and shown masked. Without an LLM key, tailoring uses the built-in keyword method.</div>
     </div>
-    <div class="card"><h3>Search queries</h3><div id="s-queries"></div>
+    <div class="card"><h3>Fully automatic mode</h3>
+      <label class="toggle"><input type="checkbox" id="s-autoq"${s.auto_queries === "0" ? "" : " checked"}> Search for the jobs the resumes are for (role + city, and Remote) — no typing needed</label>
+      <label class="toggle"><input type="checkbox" id="s-autolearn"${s.auto_learn_skills === "0" ? "" : " checked"}> Learn new skills from resumes by itself</label>
+      <div class="kv" style="margin-top:8px">
+        <label>Max searches per run</label><input type="number" id="s-maxq" min="1" max="12" value="${esc(s.max_queries || 8)}">
+        <label>Adzuna calls per day</label><input type="number" id="s-adzbud" min="0" max="240" value="${esc(s.adzuna_daily_budget || 80)}">
+      </div>
+      <div class="muted">Free Adzuna keys allow 250 calls a day and 2,500 a month. BenchPilot stays under the daily number above and slows its schedule down if needed.</div>
+      <div id="s-auto" style="margin-top:10px"><span class="muted">Loading…</span></div>
+    </div>
+    <div class="card"><h3>Search queries</h3>
+      <div class="muted" style="margin-bottom:6px">Extra searches you want on top of the automatic ones (used to fill any free search slots).</div>
+      <div id="s-queries"></div>
       <button class="btn" id="s-qadd">Add query</button></div>
     <div class="card"><h3>Enabled sources</h3>
       ${srcs.filter((x) => x.name !== "urlimport").map((x) => `
@@ -872,7 +887,7 @@ async function renderSettings() {
           <option value="360"${s.collect_interval_minutes === "360" ? " selected" : ""}>6 hours</option>
         </select>
       </div>
-      <div class="muted">BenchPilot re-pulls every enabled source on this schedule and re-matches consultants automatically — new postings land in the job board on their own. With Adzuna keys, keep 1 hour or slower (free tier allows 250 calls/day).</div>
+      <div class="muted">BenchPilot re-pulls every enabled source on this schedule and re-matches consultants automatically — new postings land in the job board on their own. With Adzuna keys it automatically slows down if needed to stay inside the free daily limit.</div>
     </div>
     <div class="card"><h3>Match threshold</h3>
       <div class="row"><input type="range" id="s-thr" min="0" max="100" value="${esc(s.match_threshold || 60)}">
@@ -893,6 +908,24 @@ async function renderSettings() {
       }).join("");
     } catch (e) { box.innerHTML = `<div class="errbox">${esc(e.message)}</div>`; }
   };
+  (async () => {
+    const box = $("#s-auto");
+    try {
+      const [st, ls] = await Promise.all([api("/api/collect/status"), api("/api/learned-skills")]);
+      const qs = (st.queries || []).map((q) => `${esc(q.title)}${q.location ? " — " + esc(q.location) : ""}`);
+      box.innerHTML = `
+        <div><b>Searching now for:</b> ${qs.length ? qs.map((x) => `<span class="badge">${x}</span>`).join(" ") : '<span class="muted">nothing yet — upload a resume</span>'}</div>
+        <div style="margin-top:6px"><b>Refresh every:</b> ${st.interval_minutes > 0 ? st.interval_minutes + " min" : "off"}${st.interval_wanted && st.interval_minutes > st.interval_wanted ? ` <span class="muted">(slowed down from ${st.interval_wanted} min to stay inside the Adzuna daily limit)</span>` : ""}
+          · <b>Adzuna calls today:</b> ${st.adzuna_used_today} / ${st.adzuna_daily_budget}</div>
+        <div style="margin-top:6px"><b>Skills learned from resumes (${ls.length}):</b>
+          ${ls.length ? ls.map((x) => `<span class="badge">${esc(x.skill)} <a href="#" data-unlearn="${esc(x.skill)}" title="Remove this skill">x</a></span>`).join(" ") : '<span class="muted">none yet</span>'}</div>`;
+      $$("#s-auto [data-unlearn]").forEach((a) => a.onclick = async (e) => {
+        e.preventDefault();
+        await api("/api/learned-skills/" + encodeURIComponent(a.dataset.unlearn), {method: "DELETE"});
+        renderSettings();
+      });
+    } catch (e) { box.innerHTML = `<span class="muted">Status unavailable</span>`; }
+  })();
   const qbox = $("#s-queries");
   const qrow = (q) => {
     const d = document.createElement("div");
@@ -922,6 +955,10 @@ async function renderSettings() {
       match_threshold: $("#s-thr").value,
       collect_interval_minutes: $("#s-interval").value,
       usa_only: $("#s-usa").checked ? "1" : "0",
+      auto_queries: $("#s-autoq").checked ? "1" : "0",
+      auto_learn_skills: $("#s-autolearn").checked ? "1" : "0",
+      max_queries: String(Math.max(1, Math.min(12, parseInt($("#s-maxq").value, 10) || 8))),
+      adzuna_daily_budget: String(Math.max(0, Math.min(240, parseInt($("#s-adzbud").value, 10) || 0))),
       collect_emp_types: readEmp($("#s-emp"), "data-semp").join(","),
     };
     // don't overwrite saved keys with the masked echo

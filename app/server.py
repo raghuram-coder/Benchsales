@@ -1,6 +1,5 @@
 """BenchPilot v1 API server. FastAPI + vanilla JS frontend."""
 import base64
-import io
 import json
 import os
 import secrets
@@ -13,8 +12,9 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app import db, emptype, portals, usa
+from app import autolearn, db, emptype, portals, usa
 from app import matcher as matcher_mod
+from app import resume as resume_mod
 from app import tailor as tailor_mod
 from app.skills import extract_skills
 from app.sources import adzuna, jsearch, remoteok, remotive, arbeitnow, dice, urlimport
@@ -50,6 +50,7 @@ async def auth_gate(request: Request, call_next):
 @app.on_event("startup")
 def _startup():
     db.init_db()
+    autolearn.sync_vocabulary()  # learned skills back into memory after a restart
     t = threading.Thread(target=_auto_collect_loop, daemon=True,
                          name="benchpilot-auto-collect")
     t.start()
@@ -59,7 +60,7 @@ def _startup():
 _collect_lock = threading.Lock()
 _collect_status = {
     "last_run_at": None,      # ISO timestamp of last finished run
-    "last_result": None,      # {"jobs_new": n, "matches_new": n}
+    "last_result": None,      # {"jobs_new": n, "matches_new": n, ...}
     "next_run_at": None,      # ISO timestamp of next scheduled run
     "running": False,
 }
@@ -74,48 +75,109 @@ def _do_collect() -> dict:
             summary = run()
         finally:
             _collect_status["running"] = False
+            # stored in the database so a restart does not reset the schedule
+            db.set_setting("last_collect_at", datetime.now(timezone.utc).isoformat())
     _collect_status["last_run_at"] = datetime.now(timezone.utc).isoformat()
     _collect_status["last_result"] = {
         "jobs_new": summary.get("jobs_new", 0),
         "matches_new": summary.get("matches_new", 0),
         "errors": summary.get("errors", []),
+        "learned_skills": summary.get("learned_skills", []),
+        "rescored": summary.get("rescored", 0),
+        "queries": summary.get("queries", []),
     }
     return summary
 
 
+def _next_due(interval: int):
+    """When the next automatic refresh is due: `interval` minutes after the
+    last finished one. The last-finished time is stored in the database, so a
+    restart (free hosting restarts often) does not reset the clock."""
+    last = db.get_setting("last_collect_at", "") or ""
+    try:
+        d = datetime.fromisoformat(last.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+    except ValueError:
+        d = None
+    if d is None:
+        return datetime.now(timezone.utc)  # never ran: run now
+    return d + timedelta(minutes=interval)
+
+
 def _auto_collect_loop():
-    """Background loop: re-pull enabled sources on the configured schedule."""
+    """Background loop: refresh jobs on the schedule. The interval is the
+    setting, slowed down when needed to respect the job API's daily limit."""
     while True:
+        time.sleep(30)
         try:
-            interval = int(db.get_setting("collect_interval_minutes", "60") or 0)
-        except (ValueError, TypeError):
-            interval = 0
-        if interval <= 0:
-            _collect_status["next_run_at"] = None
-            time.sleep(60)
-            continue
-        _collect_status["next_run_at"] = (
-            datetime.now(timezone.utc) + timedelta(minutes=interval)).isoformat()
-        time.sleep(interval * 60)
-        try:
-            _do_collect()
+            interval = autolearn.effective_interval_minutes()
+            if interval <= 0:
+                _collect_status["next_run_at"] = None
+                continue
+            due = _next_due(interval)
+            _collect_status["next_run_at"] = due.isoformat()
+            if datetime.now(timezone.utc) >= due and not _collect_status["running"]:
+                _do_collect()
         except Exception:
             pass  # collector records per-source errors; keep the loop alive
 
 
+def _kick_collect():
+    """Start a collection in the background unless one is already running
+    (used right after a resume upload so new jobs for that person arrive
+    without anyone pressing a button)."""
+    if _collect_status["running"]:
+        return False
+    threading.Thread(target=lambda: _safe_collect(), daemon=True,
+                     name="benchpilot-kick").start()
+    return True
+
+
+def _safe_collect():
+    try:
+        _do_collect()
+    except Exception:
+        pass
+
+
 @app.get("/api/collect/status")
 def api_collect_status():
+    settings = db.get_settings()
     try:
-        interval = int(db.get_setting("collect_interval_minutes", "60") or 0)
+        wanted = int(settings.get("collect_interval_minutes") or 0)
     except (ValueError, TypeError):
-        interval = 0
+        wanted = 0
+    interval = autolearn.effective_interval_minutes(settings)
+    queries = autolearn.queries_for_run(settings)
     return {
         "interval_minutes": interval,
+        "interval_wanted": wanted,
         "running": _collect_status["running"],
-        "last_run_at": _collect_status["last_run_at"],
+        "last_run_at": _collect_status["last_run_at"] or (
+            settings.get("last_collect_at") or None),
         "next_run_at": _collect_status["next_run_at"] if interval > 0 else None,
         "last_result": _collect_status["last_result"],
+        "queries": queries,
+        "auto_queries": settings.get("auto_queries", "1") == "1",
+        "adzuna_used_today": db.usage_today("adzuna"),
+        "adzuna_daily_budget": autolearn.adzuna_budget(settings),
+        "learned_skills": len(db.list_learned_skills()),
     }
+
+
+@app.get("/api/learned-skills")
+def api_learned_skills():
+    return db.list_learned_skills()
+
+
+@app.delete("/api/learned-skills/{skill}")
+def api_delete_learned_skill(skill: str):
+    if not db.delete_learned_skill(skill.lower()):
+        raise HTTPException(404, "skill not found")
+    autolearn.block_skill(skill)  # do not learn it again from the same resumes
+    autolearn.maintain()  # refresh resumes + rescore without that skill
+    return {"ok": True}
 
 
 # ---------- consultants ----------
@@ -166,22 +228,10 @@ def api_delete_consultant(cid: int):
 
 
 def _parse_resume(filename: str, data: bytes) -> str:
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext == "pdf":
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(data))
-        return "\n".join((p.extract_text() or "") for p in reader.pages)
-    if ext == "docx":
-        from docx import Document
-        doc = Document(io.BytesIO(data))
-        parts = [p.text for p in doc.paragraphs]
-        for t in doc.tables:
-            for row in t.rows:
-                parts.extend(cell.text for cell in row.cells)
-        return "\n".join(parts)
-    if ext == "txt":
-        return data.decode("utf-8", "ignore")
-    raise HTTPException(400, "unsupported file type (use .pdf, .docx, or .txt)")
+    try:
+        return resume_mod.parse(filename, data)
+    except ValueError as e:  # unsupported extension
+        raise HTTPException(400, str(e))
 
 
 @app.post("/api/consultants/{cid}/resume")
@@ -191,13 +241,48 @@ async def api_upload_resume(cid: int, file: UploadFile = File(...)):
     data = await file.read()
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(400, "file too large (10 MB max)")
-    text = _parse_resume(file.filename or "resume", data).strip()
+    if not data:
+        raise HTTPException(400, "the file is empty")
+    try:
+        text = _parse_resume(file.filename or "resume", data).strip()
+    except HTTPException:
+        raise
+    except Exception:  # damaged / password-protected / not really a .docx or .pdf
+        raise HTTPException(
+            400, "could not read this file (it may be damaged or "
+                 "password-protected); try saving it again as .docx or .pdf")
     if not text:
         raise HTTPException(400, "could not extract text from file")
+    # learn any skill names we have never seen, then read this resume with
+    # the enlarged vocabulary
+    learned: list = []
+    if db.get_setting("auto_learn_skills", "1") == "1":
+        try:
+            learned = db.add_learned_skills(
+                autolearn.candidate_skills(text), source=file.filename or "")
+            autolearn.sync_vocabulary()
+        except Exception:
+            learned = []
     skills = extract_skills(text)
     row = db.upsert_resume(cid, file.filename or "resume", text, skills)
+    # bring everything else in step (other resumes, old scores), then score
+    # this consultant against the jobs already collected, so the Matches tab
+    # is filled right away instead of after the next collection
+    try:
+        autolearn.maintain()
+        matcher_mod.rescore_existing(consultant_id=cid)
+        new_matches = matcher_mod.run_all(consultant_id=cid)
+    except Exception:  # never fail an upload because matching hiccuped
+        new_matches = 0
+    # and go and look for jobs for this person's role right now
+    searching = False
+    try:
+        searching = _kick_collect()
+    except Exception:
+        pass
     return {"filename": row["filename"], "skills": skills,
-            "chars": len(text)}
+            "chars": len(text), "new_matches": new_matches,
+            "learned_skills": learned, "searching_jobs": searching}
 
 
 # ---------- jobs ----------
@@ -426,7 +511,9 @@ def api_put_settings(data: dict):
     allowed = {"match_threshold", "search_queries", "enabled_sources",
                "adzuna_app_id", "adzuna_app_key", "rapidapi_key",
                "llm_base_url", "llm_api_key", "llm_model",
-               "collect_interval_minutes", "usa_only", "collect_emp_types"}
+               "collect_interval_minutes", "usa_only", "collect_emp_types",
+               "auto_queries", "max_queries", "auto_learn_skills",
+               "adzuna_daily_budget"}
     for k, v in data.items():
         if k not in allowed:
             raise HTTPException(400, f"unknown setting: {k}")

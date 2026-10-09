@@ -26,6 +26,13 @@ DEFAULT_SETTINGS = {
     # which employment types the recruiter wants (steers Adzuna/JSearch queries)
     "collect_emp_types": "fulltime,c2c,w2",
     "collect_interval_minutes": "60",
+    # fully automatic mode: search for what the consultants' resumes say, and
+    # learn new skill names from resumes (see app/autolearn.py)
+    "auto_queries": "1",
+    "max_queries": "8",
+    "auto_learn_skills": "1",
+    # Adzuna's default key allows 250 calls/day and 2,500/month; stay under it
+    "adzuna_daily_budget": "80",
     "search_queries": json.dumps(DEFAULT_SEARCH_QUERIES),
     "enabled_sources": json.dumps(DEFAULT_ENABLED_SOURCES),
     "adzuna_app_id": "",
@@ -110,6 +117,17 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS learned_skills (
+    skill TEXT PRIMARY KEY,
+    source TEXT DEFAULT '',
+    learned_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_usage (
+    day TEXT NOT NULL,
+    source TEXT NOT NULL,
+    hits INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, source)
+);
 """
 
 
@@ -147,6 +165,17 @@ def init_db() -> None:
             conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v)
             )
+        # when the tagging rules change (emptype.VERSION), re-tag every saved job once
+        row = conn.execute("SELECT value FROM settings WHERE key='emp_tags_version'").fetchone()
+        if not row or row["value"] != str(emptype.VERSION):
+            for r in conn.execute("SELECT id, employment_type, title, description "
+                                  "FROM jobs").fetchall():
+                tags = emptype.classify(r["employment_type"], r["title"], r["description"])
+                conn.execute("UPDATE jobs SET emp_tags=? WHERE id=?",
+                             (emptype.to_db(tags), r["id"]))
+            conn.execute("INSERT INTO settings(key, value) VALUES ('emp_tags_version', ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (str(emptype.VERSION),))
         conn.commit()
 
 
@@ -283,6 +312,61 @@ def consultants_with_resumes() -> list:
     return out
 
 
+def update_resume_skills(consultant_id: int, skills: list) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE resumes SET skills_json=? WHERE consultant_id=?",
+                     (json.dumps(skills), consultant_id))
+        conn.commit()
+
+
+# ---- learned skills (vocabulary that grows from the resumes we hold) ----
+def list_learned_skills() -> list:
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT skill, source, learned_at FROM learned_skills "
+            "ORDER BY learned_at DESC, skill")]
+
+
+def add_learned_skills(skills: list, source: str = "") -> list:
+    """Insert new skills; returns the ones that were actually new."""
+    new = []
+    with get_conn() as conn:
+        for sk in skills:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO learned_skills(skill, source, learned_at) "
+                "VALUES (?, ?, ?)", (sk, source, now_iso()))
+            if cur.rowcount:
+                new.append(sk)
+        conn.commit()
+    return new
+
+
+def delete_learned_skill(skill: str) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM learned_skills WHERE skill=?", (skill,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+# ---- daily API call budget (protects free-tier keys) ----
+def usage_today(source: str) -> int:
+    day = now_iso()[:10]
+    with get_conn() as conn:
+        r = conn.execute("SELECT hits FROM api_usage WHERE day=? AND source=?",
+                         (day, source)).fetchone()
+        return r["hits"] if r else 0
+
+
+def usage_add(source: str, hits: int) -> None:
+    day = now_iso()[:10]
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO api_usage(day, source, hits) VALUES (?, ?, ?) "
+            "ON CONFLICT(day, source) DO UPDATE SET hits = hits + excluded.hits",
+            (day, source, hits))
+        conn.commit()
+
+
 # ---- jobs ----
 def insert_job(job: dict) -> int | None:
     """Insert a job dict. Returns new id, or None if duplicate."""
@@ -385,6 +469,15 @@ def insert_match(consultant_id: int, job_id: int, score: float,
             return cur.lastrowid
         except sqlite3.IntegrityError:
             return None
+
+
+def update_match(mid: int, score: float, breakdown: dict, missing: list) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            'UPDATE "matches" SET score=?, score_breakdown_json=?, '
+            'missing_skills_json=? WHERE id=?',
+            (score, json.dumps(breakdown), json.dumps(missing), mid))
+        conn.commit()
 
 
 def match_exists(consultant_id: int, job_id: int) -> bool:
